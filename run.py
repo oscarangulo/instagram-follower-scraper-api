@@ -173,11 +173,24 @@ def scrape_followers_api(client, username, desired_count, limiter):
     print(f"[Info] - Fetching user information for @{username}...")
 
     try:
-        # Get user ID from username
-        user_id = client.user_id_from_username(username)
+        # Get user ID from username - use v1 method which is more stable
+        try:
+            user_id = client.user_id_from_username(username)
+        except TypeError:
+            # Fallback: search for user
+            print(f"[Info] - Using fallback method to find user...")
+            results = client.search_users(username)
+            user_id = None
+            for user in results:
+                if user.username.lower() == username.lower():
+                    user_id = user.pk
+                    break
+            if not user_id:
+                print(f"[Error] - User @{username} not found")
+                return []
 
-        # Get basic user info
-        user_info = client.user_info(user_id)
+        # Get basic user info using v1 method (more stable)
+        user_info = client.user_info_v1(user_id)
         total_followers = user_info.follower_count
 
         print(f"[Info] - @{username} has {total_followers} total followers")
@@ -200,8 +213,8 @@ def scrape_followers_api(client, username, desired_count, limiter):
 
         print(f"[Info] - Scraping {actual_count} followers for @{username}...")
 
-        # Fetch followers with built-in pagination
-        followers_dict = client.user_followers(user_id, amount=actual_count)
+        # Fetch followers with built-in pagination using v1 method
+        followers_dict = client.user_followers_v1(user_id, amount=actual_count)
 
         # Extract usernames
         follower_usernames = [user.username for user in followers_dict.values()]
@@ -224,6 +237,8 @@ def scrape_followers_api(client, username, desired_count, limiter):
 
     except Exception as e:
         print(f"[Error] - Failed to scrape @{username}: {str(e)}")
+        import traceback
+        traceback.print_exc()
         return []
 
 
