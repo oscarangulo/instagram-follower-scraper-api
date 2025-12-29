@@ -1,14 +1,12 @@
 import time
 import os
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.common.action_chains import ActionChains
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.common.keys import Keys
-from webdriver_manager.chrome import ChromeDriverManager as CM
-from selenium.common.exceptions import NoSuchElementException
-from selenium.webdriver.chrome.service import Service
+import random
+import json
+from instagrapi import Client
+from instagrapi.exceptions import (
+    BadPassword, ChallengeRequired, LoginRequired,
+    ReloginAttemptExceeded, UserNotFound, PleaseWaitFewMinutes
+)
 
 def save_credentials(username, password):
     with open('credentials.txt', 'w') as file:
@@ -34,93 +32,314 @@ def prompt_credentials():
     return username, password
 
 
-def login(bot, username, password):
-    bot.get('https://www.instagram.com/accounts/login/')
-    time.sleep(1)
+def random_delay(base_seconds, jitter_percent=20):
+    """Add realistic random delay with jitter"""
+    jitter = base_seconds * (jitter_percent / 100)
+    delay = base_seconds + random.uniform(-jitter, jitter)
+    return max(1.0, delay)
 
-    # Check if cookies need to be accepted
+
+def create_client():
+    """Create Instagram API client with proper settings"""
+    client = Client()
+    client.delay_range = [1, 3]
+    return client
+
+
+def save_session(client, filename='session.json'):
+    """Save session cookies for reuse"""
     try:
-        element = bot.find_element(By.XPATH, "/html/body/div[4]/div/div/div[3]/div[2]/button")
-        element.click()
-    except NoSuchElementException:
-        print("[Info] - Instagram did not require to accept cookies this time.")
-
-    print("[Info] - Logging in...")
-    username_input = WebDriverWait(bot, 10).until(EC.element_to_be_clickable((By.CSS_SELECTOR, "input[name='username']")))
-    password_input = WebDriverWait(bot, 10).until(EC.element_to_be_clickable((By.CSS_SELECTOR, "input[name='password']")))
-
-    username_input.clear()
-    username_input.send_keys(username)
-    password_input.clear()
-    password_input.send_keys(password)
-
-    login_button = WebDriverWait(bot, 2).until(EC.element_to_be_clickable((By.CSS_SELECTOR, "button[type='submit']")))
-    login_button.click()
-    time.sleep(10)
+        settings = client.get_settings()
+        with open(filename, 'w') as f:
+            json.dump(settings, f, indent=2)
+        print("[Info] - Session saved for future use")
+    except Exception as e:
+        print(f"[Warning] - Could not save session: {e}")
 
 
-def scrape_followers(bot, username, user_input):
-    bot.get(f'https://www.instagram.com/{username}/')
-    time.sleep(3.5)
-    WebDriverWait(bot, TIMEOUT).until(EC.presence_of_element_located((By.XPATH, "//a[contains(@href, '/followers')]"))).click()
-    time.sleep(2)
-    print(f"[Info] - Scraping followers for {username}...")
+def load_session(client, filename='session.json'):
+    """Load saved session if valid"""
+    if not os.path.exists(filename):
+        return False
 
-    users = set()
+    try:
+        with open(filename, 'r') as f:
+            settings = json.load(f)
 
-    while len(users) < user_input:
-        followers = bot.find_elements(By.XPATH, "//a[contains(@href, '/')]")
+        client.set_settings(settings)
+        client.login(client.username, client.password)
 
-        for i in followers:
-            if i.get_attribute('href'):
-                users.add(i.get_attribute('href').split("/")[3])
+        print("[Info] - Session loaded successfully")
+        return True
+
+    except Exception as e:
+        print(f"[Info] - Could not load session: {e}")
+        if os.path.exists(filename):
+            os.remove(filename)
+        return False
+
+
+def save_partial_results(username, followers, is_partial=True):
+    """Save partial results if scraping is interrupted"""
+    suffix = "_partial" if is_partial else ""
+    filename = f'{username}_followers{suffix}.txt'
+
+    with open(filename, 'w') as file:
+        file.write('\n'.join(followers) + "\n")
+
+    print(f"[Info] - {'Partial results' if is_partial else 'Results'} saved to {filename}")
+    return filename
+
+
+class SessionLimiter:
+    """Track session limits to avoid rate limiting"""
+    def __init__(self, max_followers_per_session=2000, max_users_per_session=10):
+        self.max_followers = max_followers_per_session
+        self.max_users = max_users_per_session
+        self.followers_scraped = 0
+        self.users_scraped = 0
+
+    def can_scrape_user(self):
+        """Check if we can scrape another user"""
+        return self.users_scraped < self.max_users
+
+    def get_remaining_quota(self):
+        """Get remaining follower quota"""
+        return max(0, self.max_followers - self.followers_scraped)
+
+    def record_scrape(self, follower_count):
+        """Record completed scrape"""
+        self.users_scraped += 1
+        self.followers_scraped += follower_count
+
+
+def api_login(client, username, password):
+    """
+    Perform API-based login with error handling
+    Returns: True if successful, False otherwise
+    """
+    print("[Info] - Attempting to log in via API...")
+
+    # Try to load existing session
+    if load_session(client):
+        print("[Info] - Using saved session")
+        return True
+
+    try:
+        client.login(username, password)
+        print("[Info] - Login successful!")
+
+        # Save session for future use
+        save_session(client)
+
+        return True
+
+    except BadPassword:
+        print("[Error] - Invalid username or password")
+        # Delete saved credentials
+        if os.path.exists('credentials.txt'):
+            os.remove('credentials.txt')
+            print("[Info] - Credentials file deleted. Please run again with correct credentials.")
+        return False
+
+    except ChallengeRequired as e:
+        print("[Error] - Instagram requires additional verification")
+        print("[Info] - Please log in via browser and complete the challenge, then try again")
+        return False
+
+    except ReloginAttemptExceeded:
+        print("[Error] - Too many login attempts")
+        print("[Info] - Please wait 24 hours before trying again")
+        return False
+
+    except Exception as e:
+        print(f"[Error] - Login failed: {str(e)}")
+        return False
+
+
+def scrape_followers_api(client, username, desired_count, limiter):
+    """
+    Scrape followers using Instagram API with rate limiting
+
+    Args:
+        client: Instagrapi Client instance
+        username: Instagram username to scrape
+        desired_count: Number of followers to fetch
+        limiter: SessionLimiter instance
+
+    Returns:
+        List of follower usernames
+    """
+    print(f"[Info] - Fetching user information for @{username}...")
+
+    try:
+        # Get user ID from username
+        user_id = client.user_id_from_username(username)
+
+        # Get basic user info
+        user_info = client.user_info(user_id)
+        total_followers = user_info.follower_count
+
+        print(f"[Info] - @{username} has {total_followers} total followers")
+
+        # Check if private
+        if user_info.is_private:
+            friendship = client.user_friendship(user_id)
+            if not friendship.following:
+                print(f"[Warning] - @{username} is private and you don't follow them")
+                print(f"[Info] - Cannot scrape followers from private accounts you don't follow")
+                return []
             else:
-                continue
+                print(f"[Info] - Account is private but you follow them")
 
-        ActionChains(bot).send_keys(Keys.END).perform()
-        time.sleep(1)
+        # Check session limits
+        actual_count = min(desired_count, total_followers, limiter.get_remaining_quota())
 
-    users = list(users)[:user_input]  # Trim the user list to match the desired number of followers
+        if actual_count < desired_count:
+            print(f"[Info] - Adjusted count to {actual_count} due to limits")
 
-    print(f"[Info] - Saving followers for {username}...")
-    with open(f'{username}_followers.txt', 'a') as file:
-        file.write('\n'.join(users) + "\n")
+        print(f"[Info] - Scraping {actual_count} followers for @{username}...")
+
+        # Fetch followers with built-in pagination
+        followers_dict = client.user_followers(user_id, amount=actual_count)
+
+        # Extract usernames
+        follower_usernames = [user.username for user in followers_dict.values()]
+
+        print(f"[Info] - Successfully scraped {len(follower_usernames)} followers")
+
+        # Record in limiter
+        limiter.record_scrape(len(follower_usernames))
+
+        return follower_usernames
+
+    except UserNotFound:
+        print(f"[Error] - User @{username} not found")
+        return []
+
+    except PleaseWaitFewMinutes:
+        print(f"[Error] - Rate limit reached while scraping @{username}")
+        print(f"[Info] - Please wait 15-30 minutes before trying again")
+        raise
+
+    except Exception as e:
+        print(f"[Error] - Failed to scrape @{username}: {str(e)}")
+        return []
 
 
 def scrape():
-    credentials = load_credentials()
+    """Main scraping function"""
+    print("=" * 60)
+    print("Instagram Follower Scraper - API Mode")
+    print("=" * 60)
 
+    # Load credentials
+    credentials = load_credentials()
     if credentials is None:
         username, password = prompt_credentials()
     else:
         username, password = credentials
+        print(f"[Info] - Using saved credentials for {username}")
 
-    user_input = int(input('[Required] - How many followers do you want to scrape (100-2000 recommended): '))
+    # Get user input
+    desired_count = int(input('[Required] - How many followers do you want to scrape (100-2000 recommended): '))
+
+    if desired_count > 2000:
+        print("[Warning] - Scraping >2000 followers may trigger rate limits")
+        confirm = input("Continue anyway? (y/n): ")
+        if confirm.lower() != 'y':
+            print("[Info] - Exiting...")
+            return
 
     usernames = input("Enter the Instagram usernames you want to scrape (separated by commas): ").split(",")
+    usernames = [u.strip() for u in usernames if u.strip()]
 
-    service = Service()
-    options = webdriver.ChromeOptions()
-    # options.add_argument("--headless")
-    options.add_argument('--no-sandbox')
-    options.add_argument("--log-level=3")
-    mobile_emulation = {
-        "userAgent": "Mozilla/5.0 (Linux; Android 4.2.1; en-us; Nexus 5 Build/JOP40D) AppleWebKit/535.19 (KHTML, like Gecko) Chrome/90.0.1025.166 Mobile Safari/535.19"}
-    options.add_experimental_option("mobileEmulation", mobile_emulation)
+    print(f"\n[Info] - Will scrape {desired_count} followers from {len(usernames)} account(s)")
+    print("[Info] - Using Instagram API (no browser required)")
+    print()
 
+    # Create API client
+    client = create_client()
 
-    bot = webdriver.Chrome(service=service, options=options)
-    bot.set_page_load_timeout(15) # Set the page load timeout to 15 seconds
+    # Login
+    if not api_login(client, username, password):
+        print("[Error] - Authentication failed. Exiting...")
+        return
 
-    login(bot, username, password)
+    print()
 
-    for user in usernames:
-        user = user.strip()
-        scrape_followers(bot, user, user_input)
+    # Create session limiter
+    limiter = SessionLimiter(
+        max_followers_per_session=min(desired_count * len(usernames), 2000),
+        max_users_per_session=len(usernames)
+    )
 
-    bot.quit()
+    # Scrape each user
+    successful_scrapes = 0
+
+    for idx, target_username in enumerate(usernames, 1):
+        print(f"\n{'='*60}")
+        print(f"[{idx}/{len(usernames)}] Processing @{target_username}")
+        print(f"{'='*60}")
+
+        if not limiter.can_scrape_user():
+            print("[Warning] - Session limit reached")
+            print("[Info] - Remaining users will be skipped")
+            break
+
+        try:
+            # Add delay between users
+            if idx > 1:
+                delay = random_delay(10.0, jitter_percent=30)
+                print(f"[Info] - Waiting {delay:.1f}s before next user...")
+                time.sleep(delay)
+
+            # Scrape followers
+            followers = scrape_followers_api(
+                client,
+                target_username,
+                desired_count,
+                limiter
+            )
+
+            if followers:
+                # Save to file
+                filename = f'{target_username}_followers.txt'
+                with open(filename, 'w') as file:
+                    file.write('\n'.join(followers) + "\n")
+
+                print(f"[Success] - Saved {len(followers)} followers to {filename}")
+                successful_scrapes += 1
+            else:
+                print(f"[Warning] - No followers collected for @{target_username}")
+
+        except PleaseWaitFewMinutes:
+            print(f"\n[Error] - Rate limit reached")
+            print(f"[Info] - Successfully scraped {successful_scrapes}/{len(usernames)} accounts")
+            print(f"[Info] - Please wait 15-30 minutes before continuing")
+            break
+
+        except KeyboardInterrupt:
+            print(f"\n[Info] - Interrupted by user")
+            print(f"[Info] - Successfully scraped {successful_scrapes}/{len(usernames)} accounts")
+            break
+
+        except Exception as e:
+            print(f"[Error] - Unexpected error: {str(e)}")
+            continue
+
+    print(f"\n{'='*60}")
+    print(f"[Complete] - Scraped {successful_scrapes}/{len(usernames)} accounts")
+    print(f"[Info] - Session limit: {limiter.followers_scraped}/{limiter.max_followers} followers used")
+    print(f"{'='*60}\n")
 
 
 if __name__ == '__main__':
-    TIMEOUT = 15
-    scrape()
+    try:
+        scrape()
+    except KeyboardInterrupt:
+        print("\n[Info] - Exiting...")
+    except Exception as e:
+        print(f"\n[Fatal Error] - {str(e)}")
+        import traceback
+        traceback.print_exc()
